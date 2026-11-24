@@ -1,0 +1,20 @@
+# Index
+
+Top-level layout of this directory. Each entry is one click away.
+
+## Files at root
+
+- [Index](Index) - this file
+- [AGENTS.md](AGENTS.md) - orientation for AI agents working in this repo
+- [README](README) - what this infrastructure is, what problems it solves, and how the pieces fit together
+- [installation-instructions](installation-instructions) - step-by-step guide for installing the synchronizer on a new machine
+
+## Directories
+
+- [scripts/](scripts/) - the three executable scripts: `bidirectional-sync`, `ref-change-watcher`, `orphan-ref-pruner`
+- [script-internals/](script-internals/) - per-mechanism technical deep-dives referenced from inside each script and from the README
+- [support-artifacts/](support-artifacts/) - shared library + user-tunable settings + runtime state file
+  - `shared-helpers.sh` - config loader and shared helpers sourced by all three scripts
+  - `user-settings.conf` - the user-tunable knobs (debounce, rescan interval, heartbeat interval, log cap, Gitea API page size, auto-prune toggle)
+  - `.heartbeat` - timestamp of the last heartbeat line the watcher wrote
+- [activity-log/](activity-log/) - runtime log file (`activity.log`)

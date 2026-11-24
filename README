@@ -1,0 +1,172 @@
+# README - Syncing Gitea and machine-native Git
+
+*Continuous bidirectional sync between every machine-native Git repository and its Gitea copy.*
+
+
+
+# Table of Contents
+
+1. Problems Addressed
+   - Core problem — Gitea and machine-native Git don't sync automatically
+   - Supplementary problem — Residual commits from deleted branches
+2. Solution Composition
+3. How the scripts fit together
+4. How to install
+
+
+
+# Problems Addressed
+
+## Core problem — Gitea and machine-native Git don't sync automatically
+
+Gitea is an attractive dashboard for anyone who wants a visual interface to interact with their Git repositories: a browsable UI for commits, branches, pull requests, and the commit graph, so the user can get a better grasp of how their work has evolved without parsing `git log` output by hand.
+
+But Gitea doesn't read the user's existing repositories where they already live on disk. Instead, it stores its own bare copies inside its data directory (`/var/lib/gitea/data/gitea-repositories/<user>/<repo>.git`), as entirely separate repositories. 
+
+This means that if user makes a commit from the terminal or via an agent in their working tree on disk, that commit will not show up in Gitea's dashboard. 
+
+The same is true for for the opposite direction. If the user merges a PR, deletes a branch, or edits a file through Gitea's UI, the change lives only inside Gitea's bare copy and never reaches the working tree on disk.
+
+That creates two sources of truth for the same repository, which can cause real confusion. 
+
+The split affects every kind of Git interaction: commits, pull requests, branch creates and deletes, merges, tags, and brand-new repositories created on either side.
+
+If the user wants one source of truth for their Git:
+- To make Git changes from the terminal or through AI agents on their machine's native Git and see them reflected in Gitea's dashboard,
+- Or to make Git changes through Gitea's dashboard and have them propagate down to their machine's native Git,
+
+then the two sides need to be synchronized continuously.
+
+
+
+## Supplementary problem — Residual commits from deleted branches
+
+When a branch is deleted, the commits that lived only on that branch become unreachable - no branch or tag still points at them. Git does not throw those commits away immediately. They linger in the repository's object store until Git's own garbage collector eventually gets around to them, which can take days or weeks on a quiet repo.
+
+For a visualizer like Gitea, that creates a cosmetic but real problem: the commit graph keeps drawing those unreachable commits as ghost history - orphaned lines drifting off into nowhere, long after the branch they belonged to is gone. Every branch deletion leaves its own patch of ghost history behind, and over time the graph fills with clutter that has nothing to do with the user's current work.
+
+In Gitea, each pull request has a hidden ref (`refs/pull/N/head`) pinning its commits. If a pull-request row has ever been removed from Gitea's database out-of-band, the hidden ref is left behind, and Git's garbage collector cannot prune the PR's commits even after the branch is deleted, because the hidden ref still holds them in place.
+
+This infrastructure addresses both problems. It runs an immediate cleanup pass whenever any branch or tag is deleted on either side, and it specifically catches Gitea's orphaned pull-request refs before running garbage collection. The result is that the graph always matches reality. If a branch is gone, its commits disappear from the picture at the same time.
+
+Auto-pruning is on by default. The user can disable it by setting `AUTO_PRUNE=false` in `support-artifacts/user-settings.conf` - useful if the user prefers to run garbage collection on their own schedule, or wants to inspect unreachable commits before they're purged. The pruner script remains runnable by hand even when the automatic trigger is off.
+
+
+
+# Solution
+
+To solve this problem, a set of synchronization scripts was developed. It keeps the machine's native repositories and Gitea's bare repositories in continuous bidirectional sync. The user can make edits from the terminal, from an agent, or from Gitea's dashboard, and all three paths converge on the same source of truth.
+
+
+## bidirectional-sync — keeps every local git repo and its Gitea copy identical
+
+This is the core script that runs the main sync logic. It walks every repo under `SCAN_ROOTS` and reconciles local and Gitea branch-by-branch:
+
+- Fast-forwards local when behind Gitea; pushes to Gitea when behind local; flags true divergence as a manual conflict.
+- Propagates branch creates and deletes in either direction (uses a state file in `.git/info/` to tell "new" from "deleted").
+- Same logic for tags.
+- Imports new local repos into Gitea; clones new Gitea repos down to disk.
+- Reconciles Gitea's SQLite database against actual refs to sweep phantom branches.
+- Verifies every branch's HEAD matches after sync; logs any mismatch.
+- Triggers `orphan-ref-pruner` immediately on any delete (when `AUTO_PRUNE=true`).
+
+Logging is deliberately quiet: successful runs write nothing, only real problems (conflicts, failures, phantom cleanup) make it into the log. The log is trimmed back to the most recent `LOG_MAX_LINES` entries (default 1000) when it grows past that.
+
+- To read implementation details, see [script-internals/bidirectional-sync.md](script-internals/bidirectional-sync.md) (plus `bidirectional-sync-1.md` through `bidirectional-sync-6.md` in the same folder for per-mechanism deep dives).
+- path: gitea-to-local-git-synchronizer/scripts/bidirectional-sync
+- log: gitea-to-local-git-synchronizer/activity-log/activity.log
+
+
+## ref-change-watcher — the daemon that triggers the sync the moment anything changes
+
+The sync script above doesn't know when to run. This one decides. It sits running all the time and watches the file-system directly: both the .git/refs folder in every local repo, and the matching folders inside each of Gitea's bare repos. The moment a branch pointer changes on either side — because the user committed locally, or because Gitea's UI merged a PR, or anything else — the operating system wakes this script up within a fraction of a second.
+
+When that happens, it waits DEBOUNCE_MS milliseconds (default 150, so a push that updates several branches at once counts as one event, not ten overlapping syncs), then runs bidirectional-sync once.
+
+As a safety net, even when nothing is happening it still runs the sync once every RESCAN_SECONDS seconds (default 60). This also catches brand-new repos: if the user runs git init in a fresh folder, the watcher wouldn't have had its file watch set up on it, but the periodic rescan will find it.
+
+Every HEARTBEAT_SECONDS seconds (default 43200, i.e. 12 hours), if nothing has gone wrong in between, it writes a single heartbeat line to the log — "heartbeat: synchronizer is operational, local and Gitea repositories are in sync, orphaned commits have been pruned" — so the user can glance at the log and see it's still breathing.
+
+- To read implementation details, see [script-internals/ref-change-watcher.md](script-internals/ref-change-watcher.md) (plus `ref-change-watcher-1.md` in the same folder for the Gitea bare-repo watch rationale).
+- path: gitea-to-local-git-synchronizer/scripts/ref-change-watcher
+- runs continuously (as the systemd service `gitea-to-local-git-synchronizer-watcher.service`)
+- log: gitea-to-local-git-synchronizer/activity-log/activity.log
+
+
+## orphan-ref-pruner — garbage-collects the dead commits that deletions leave behind
+
+When a branch is deleted, the commits that only lived on that branch become unreachable — no branch or tag points at them anymore — but git doesn't throw them away immediately. They hang around until git is told to clean house. Left alone, the visualizer keeps drawing those dangling commits on the graph and they look like ghost history.
+
+This script walks every local repo and every Gitea bare repo and runs git's own garbage collection on each one, forcing it to actually throw out those unreachable objects right now (instead of whenever it would get around to it on its own).
+
+It does one extra thing for Gitea specifically. Each pull request has a hidden ref pointing at its commits (refs/pull/N/head). If a PR row has been removed from Gitea's database but the ref wasn't cleaned up, garbage collection can't prune those commits because the ref still points at them. So the script first checks Gitea's database for which PR numbers really still exist and deletes any refs whose PR is gone, then runs garbage collection.
+
+To read implementation details, see [script-internals/orphan-ref-pruner.md](script-internals/orphan-ref-pruner.md) (plus `orphan-ref-pruner-1.md` in the same folder for the orphan pull-ref cleanup rationale).
+
+- path: gitea-to-local-git-synchronizer/scripts/orphan-ref-pruner
+- runs every 5 minutes via cron, and also triggered immediately by bidirectional-sync when it deletes anything
+- supports --dry-run for inspecting what it would delete without touching anything
+
+
+## activity.log — the single log all three scripts write to
+
+Shared log file. The sync script writes errors and conflict reports here; the watcher script writes its 12-hour heartbeat here; the pruner writes here on errors. The sync script trims it back to the most recent LOG_MAX_LINES entries (default 1000) when it grows past that, so it doesn't balloon.
+
+- path: gitea-to-local-git-synchronizer/activity-log/activity.log
+
+
+## .heartbeat — tiny timestamp file used by the watcher
+
+Just holds the Unix timestamp of the last heartbeat line the watcher wrote to the log, so the watcher can tell when the heartbeat interval has elapsed and it's time to write another.
+
+- path: gitea-to-local-git-synchronizer/support-artifacts/.heartbeat
+
+
+## shared-helpers.sh — common setup that the three scripts all reuse
+
+Every one of the three scripts needs the same handful of things: where Gitea lives on this machine, which user owns the repos there, the access token for its API, which folders on disk to scan for local git repos, and where to write the shared log file. Rather than repeating that in each script, this file holds it once and the three scripts pull it in on startup.
+
+It also sources `user-settings.conf` (the user-tunable settings file) and fills in defaults for any setting that file doesn't provide, so the scripts work out of the box even if the settings file is missing.
+
+Finally, it defines two small helpers they all call: one that writes a timestamped ERROR line to the log, and one that walks the configured folders and prints every local git repo it finds (skipping node_modules, caches, virtualenvs, and similar junk).
+
+It is not executed on its own — the other scripts source it as their first step.
+
+- To read implementation details, see [script-internals/shared-helpers.md](script-internals/shared-helpers.md).
+- path: gitea-to-local-git-synchronizer/support-artifacts/shared-helpers.sh
+
+
+## user-settings.conf — user-tunable settings for the sync infrastructure
+
+A plain-text config file that holds the tunable knobs for the whole system: debounce time, rescan interval, heartbeat interval, log size cap, Gitea API page size, and the auto-prune toggle. Each setting is preceded by a short plain-language comment explaining what it controls and what a sensible range looks like.
+
+Sourced by shared-helpers.sh at script startup. After editing, bidirectional-sync and orphan-ref-pruner pick up changes on their next run. The ref-change-watcher daemon needs a restart to apply changes to its own tunables (DEBOUNCE_MS, RESCAN_SECONDS, HEARTBEAT_SECONDS).
+
+- path: gitea-to-local-git-synchronizer/support-artifacts/user-settings.conf
+
+
+
+# How the scripts fit together
+
+The watcher runs forever and listens for any branch change on either side. 
+
+When a change happens, or every RESCAN_SECONDS as a safety net, it fires the sync script. The sync script walks every repo, compares local and Gitea branch-by-branch, pushes or pulls or deletes to make them match, imports brand-new repos in either direction, and fixes up Gitea's database if it has drifted from reality. 
+
+If the sync deleted anything, it kicks off the pruner right away so the dead commits don't linger; the pruner also runs every 5 minutes from cron on its own. All four files — the three scripts plus shared-helpers.sh — read configuration from the same places (`/etc/gitea-sync.env` for secrets and infrastructure paths, `support-artifacts/user-settings.conf` for tunable knobs), and all three scripts write to the same activity.log.
+
+
+
+# How to install
+
+The full step-by-step installation guide lives at `gitea-to-local-git-synchronizer/installation-instructions`. 
+
+It covers the six steps for getting the synchronizer running on a new machine: 
+
+1. placing the files
+2. setting up the credentials file at `/etc/gitea-sync.env`
+3. reviewing the user-tunable settings in `support-artifacts/user-settings.conf`
+4. installing the systemd service
+5. (optional) installing the cron entry for the pruner
+6. verifying the installation
+
+Prerequisites, troubleshooting pointers, and an uninstall procedure are documented there as well.

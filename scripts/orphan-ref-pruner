@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# Technical details: script-internals/orphan-ref-pruner.md
+
+set -uo pipefail
+
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$PROJECT_ROOT/support-artifacts/shared-helpers.sh"
+
+: "${GITEA_DB:=/var/lib/gitea/data/gitea.db}"
+
+# --dry-run: don't delete anything, just print what would happen.
+DRY_RUN=0
+if [ "${1:-}" = "--dry-run" ]; then
+    DRY_RUN=1
+fi
+
+# See script-internals/orphan-ref-pruner-1.md
+prune_orphan_pull_refs() {
+    local bare=$1 repo_name=$2
+    [ -x "$(command -v sqlite3)" ] || return 0
+    [ -f "$GITEA_DB" ] || return 0
+
+    # Gitea's repository.id → needed to filter pull_request rows.
+    local repo_id
+    repo_id=$(sqlite3 "$GITEA_DB" \
+        "SELECT id FROM repository WHERE owner_name='$GITEA_USER' AND lower_name='$(echo "$repo_name" | tr '[:upper:]' '[:lower:]')' LIMIT 1;" 2>/dev/null)
+    [ -z "$repo_id" ] && return 0
+
+    # Collect the pull-request indexes gitea still knows about.
+    local -A known=()
+    while IFS= read -r idx; do
+        [ -n "$idx" ] && known[$idx]=1
+    done < <(sqlite3 "$GITEA_DB" "SELECT \"index\" FROM pull_request WHERE base_repo_id=$repo_id;" 2>/dev/null)
+
+    # Walk refs/pull/* in the bare; drop any whose number isn't in known.
+    while IFS= read -r ref; do
+        local n
+        n=$(echo "$ref" | awk -F/ '{print $3}')
+        [ -z "$n" ] && continue
+        if [ -z "${known[$n]:-}" ]; then
+            if [ "$DRY_RUN" = "1" ]; then
+                echo "DRY-RUN: would delete $ref in $repo_name (no matching PR in DB)"
+            else
+                git -C "$bare" update-ref -d "$ref" 2>/dev/null \
+                    && err_log "pruned orphan pull ref $ref in $repo_name"
+            fi
+        fi
+    done < <(git -C "$bare" for-each-ref --format='%(refname)' refs/pull/ 2>/dev/null)
+}
+
+# Prune one git dir (bare or .git/). Returns 0 even on soft failures so cron
+# doesn't alarm.
+prune_one() {
+    local gd=$1
+    [ -d "$gd" ] || return 0
+    git -C "$gd" reflog expire --expire=now --all 2>/dev/null
+    # --auto is fast when there's nothing to do and triggers full gc only
+    # when the object count is past git's own threshold.
+    git -C "$gd" gc --auto --prune=now --quiet 2>/dev/null || true
+}
+
+main() {
+    # Local repos
+    while IFS= read -r g; do
+        [ -z "$g" ] && continue
+        prune_one "$g"
+    done < <(find_repos)
+
+    # Gitea bare repos: drop orphan pull refs first (so gc sees them as
+    # unreachable), then gc normally.
+    if [ -d "$GITEA_REPOS_DIR/$GITEA_USER" ]; then
+        for bare in "$GITEA_REPOS_DIR/$GITEA_USER"/*.git; do
+            [ -d "$bare" ] || continue
+            local repo_name
+            repo_name=$(basename "$bare" .git)
+            prune_orphan_pull_refs "$bare" "$repo_name"
+            [ "$DRY_RUN" = "1" ] && continue
+            prune_one "$bare"
+        done
+    fi
+}
+
+main "$@"

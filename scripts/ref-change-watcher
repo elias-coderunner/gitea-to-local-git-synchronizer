@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# Technical details: script-internals/ref-change-watcher.md
+
+set -uo pipefail
+
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$PROJECT_ROOT/support-artifacts/shared-helpers.sh"
+
+SYNC="$PROJECT_ROOT/scripts/bidirectional-sync"
+HEARTBEAT_FILE="$PROJECT_ROOT/support-artifacts/.heartbeat"
+
+heartbeat_if_due() {
+    local now last_epoch
+    now=$(date +%s)
+    if [ -r "$HEARTBEAT_FILE" ]; then
+        last_epoch=$(cat "$HEARTBEAT_FILE" 2>/dev/null)
+        [[ "$last_epoch" =~ ^[0-9]+$ ]] || last_epoch=0
+    else
+        last_epoch=0
+    fi
+    if [ $((now - last_epoch)) -ge "$HEARTBEAT_SECONDS" ]; then
+        printf '%s\n' "$now" > "$HEARTBEAT_FILE"
+        printf '%s  heartbeat: synchronizer is operational, local and Gitea repositories are in sync, orphaned commits have been pruned\n\n' \
+            "$(date '+%Y-%m-%d %H:%M:%S')" >> "$LOG"
+    fi
+}
+
+# Enumerate all directories that hold refs we care about: every local .git/refs
+# under SCAN_ROOTS plus every Gitea bare repo's refs.
+watch_paths() {
+    # Local repos: watch each .git directory. refs/ and HEAD cover all branch moves.
+    find_repos | while read -r g; do
+        [ -d "$g/refs" ] && echo "$g/refs"
+        [ -d "$g/logs" ] && echo "$g/logs"
+        echo "$g/HEAD"
+        echo "$g/packed-refs" 2>/dev/null
+    done
+    # See script-internals/ref-change-watcher-1.md
+    if [ -d "$GITEA_REPOS_DIR/$GITEA_USER" ]; then
+        echo "$GITEA_REPOS_DIR/$GITEA_USER"
+        for bare in "$GITEA_REPOS_DIR/$GITEA_USER"/*.git; do
+            [ -d "$bare/refs" ] && echo "$bare/refs"
+            [ -f "$bare/packed-refs" ] && echo "$bare/packed-refs"
+        done
+    fi
+    # Also watch each local repo's parent directory so brand-new local repos
+    # (git init in SCAN_ROOTS) are discovered.
+    for root in $SCAN_ROOTS; do
+        [ -d "$root" ] && echo "$root"
+    done
+}
+
+# Debounce: wait for a quiet period before syncing.
+debounced_sync() {
+    sleep "$(( DEBOUNCE_MS / 1000 )).$(printf '%03d' $(( DEBOUNCE_MS % 1000 )))"
+    "$SYNC"
+}
+
+main() {
+    # One sync on startup so we begin in a consistent state.
+    "$SYNC"
+    heartbeat_if_due
+
+    while true; do
+        # Build the current watch list. Rescanned on every loop iteration
+        # so newly created repos are picked up on the next cycle.
+        mapfile -t PATHS < <(watch_paths 2>/dev/null)
+
+        if [ "${#PATHS[@]}" -eq 0 ]; then
+            sleep "$RESCAN_SECONDS"
+            heartbeat_if_due
+            continue
+        fi
+
+        # Wait for ANY event on any watched path, or RESCAN_SECONDS timeout.
+        # -q quiet, -r recursive, -e the events we care about.
+        if inotifywait -q -r -t "$RESCAN_SECONDS" \
+                -e modify,create,delete,move,close_write \
+                "${PATHS[@]}" >/dev/null 2>&1; then
+            # Event fired — debounce then sync.
+            debounced_sync
+        else
+            # Timeout — periodic rescan sync (cheap safety net).
+            "$SYNC"
+        fi
+        heartbeat_if_due
+    done
+}
+
+main "$@"

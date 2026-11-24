@@ -1,0 +1,223 @@
+# Installation instructions
+
+How to install the gitea-to-local-git synchronizer on a new machine, step by step. The order matters: prerequisites, files in place, credentials, systemd service, cron, verification.
+
+The commands below use placeholder values. Substitute the real ones for the target machine:
+
+- `<user>` — the Linux username that owns the Git repositories to be synced (also the user the service will run as).
+- `<user-home>` — that user's home directory (usually `/home/<user>`).
+- `<install-dir>` — the absolute path where this `gitea-to-local-git-synchronizer/` directory lives on disk.
+- `<gitea-host>` — the hostname or IP of the Gitea instance.
+- `<gitea-port>` — the port Gitea listens on (default `3000`).
+- `<gitea-username>` — the Gitea account whose repositories are kept in sync.
+- `<gitea-api-token>` — an API token issued to that account.
+
+
+## Prerequisites
+
+### On the sync machine
+
+1. Linux with systemd and cron. Any modern distribution works.
+2. Command-line tools installed: `bash`, `inotify-tools` (provides `inotifywait`), `sqlite3`, `curl`, `python3`, `git`. On Debian/Ubuntu:
+   ```
+   sudo apt install bash inotify-tools sqlite3 curl python3 git
+   ```
+3. A Linux user account that owns the Git repositories to be synced (that's `<user>` below).
+4. Avoid `<user-home>` paths containing spaces — `SCAN_ROOTS` is word-split on whitespace.
+
+### On the Gitea side
+
+1. A running Gitea instance reachable from the sync machine over HTTP or HTTPS.
+2. An account with an API token that has `repo` write permission. Generate the token in Gitea's web UI: Settings → Applications → Generate New Token. **Record the token immediately — it is shown only once.**
+3. If the sync machine will auto-import local repositories into Gitea (i.e. repositories that exist locally but not yet on Gitea), Gitea must allow migrations from local/private addresses. In Gitea's `app.ini`:
+   ```
+   [migrations]
+   ALLOW_LOCALNETWORKS = true
+   ```
+   Restart Gitea after changing this. Skip only if you will create every repository manually in Gitea before adding it on disk.
+
+### If Gitea runs on the same box as the synchronizer
+
+The synchronizer reads bare repositories directly from `GITEA_REPOS_DIR` (default `/var/lib/gitea/data/gitea-repositories`) and writes to Gitea's SQLite database (`GITEA_DB`, default `/var/lib/gitea/data/gitea.db`). Both paths are owned by the `gitea` user by default. The service user `<user>` must be able to read the bare repos and read/write the database.
+
+The simplest route:
+
+```
+sudo usermod -a -G gitea <user>
+sudo chmod g+rwX /var/lib/gitea/data/gitea.db /var/lib/gitea/data/gitea-repositories
+sudo find /var/lib/gitea/data/gitea-repositories -type d -exec chmod g+rwx {} \;
+sudo find /var/lib/gitea/data/gitea-repositories -type f -exec chmod g+rw {} \;
+```
+
+Log out and back in (or restart the service after Step 4) so the new group takes effect.
+
+### If Gitea runs on a different host
+
+This synchronizer **requires filesystem access** to Gitea's bare repositories and SQLite database. The core sync fetches from `GITEA_REPOS_DIR/<user>/<repo>.git` directly on disk, not over the Gitea HTTP API, and the auxiliary features (DB reconcile, pull-request pruning) also read and write the Gitea data directory.
+
+Options when Gitea runs on a different host:
+
+- Mount Gitea's data directory on the sync machine (NFS, sshfs, etc.) and set `GITEA_REPOS_DIR` / `GITEA_DB` in `/etc/gitea-sync.env` to the mount paths. The mount must be read-write; the service user must have read access to the bare repos and read-write access to the database file.
+- Or run the synchronizer on the Gitea host itself.
+
+A pure-remote, API-only mode is not supported.
+
+
+## Step 1: Place the files
+
+Copy or clone the `gitea-to-local-git-synchronizer/` directory into a stable location on disk. That location is `<install-dir>` below.
+
+Make the three scripts executable:
+
+```
+chmod +x <install-dir>/scripts/bidirectional-sync <install-dir>/scripts/ref-change-watcher <install-dir>/scripts/orphan-ref-pruner
+```
+
+
+## Step 2: Set up the credentials file
+
+This file holds the Gitea URL, Gitea username, Gitea API token, and the folders to scan for Git repositories. It lives in `/etc/` because it holds a secret.
+
+Create `/etc/gitea-sync.env` with content like this (all four variables are required):
+
+```
+GITEA_URL=http://<gitea-host>:<gitea-port>
+GITEA_USER=<gitea-username>
+GITEA_TOKEN=<gitea-api-token>
+SCAN_ROOTS=<user-home>
+```
+
+`GITEA_URL` must include the scheme. Both `http://` and `https://` are supported — the scheme you supply is preserved in all push and clone URLs. `SCAN_ROOTS` is a space-separated list of root directories under which the synchronizer searches recursively for `.git` folders (excluding `node_modules`, `.cache`, virtualenvs, and similar — see `EXCLUDE_REGEX` below).
+
+Optional overrides (defaults shown):
+
+```
+GITEA_REPOS_DIR=/var/lib/gitea/data/gitea-repositories
+GITEA_DB=/var/lib/gitea/data/gitea.db
+EXCLUDE_REGEX=/(node_modules|\.nvm|\.cache|\.local/share|vendor|\.venv|venv)/
+```
+
+`GITEA_REPOS_DIR` and `GITEA_DB` must resolve to the actual Gitea data paths reachable from this machine; if Gitea is on another host, these must point at the mount where its data directory is exposed (see "If Gitea runs on a different host" above).
+
+Lock the file down so only root and `<user>` can read it:
+
+```
+sudo chown root:<user> /etc/gitea-sync.env
+sudo chmod 640 /etc/gitea-sync.env
+```
+
+
+## Step 3: Review user-settings.conf (optional)
+
+The file `<install-dir>/support-artifacts/user-settings.conf` holds the tunable knobs: debounce time, rescan interval, heartbeat interval, log cap, Gitea API page size, and the `AUTO_PRUNE` toggle. The defaults are sensible for most users. Each setting has a plain-language comment explaining what it does. Edit any values worth changing; skip this step to run on defaults.
+
+
+## Step 4: Install the systemd service
+
+This runs `ref-change-watcher` continuously in the background, surviving reboots and restarting on crash.
+
+Create `/etc/systemd/system/gitea-to-local-git-synchronizer-watcher.service` with:
+
+```
+[Unit]
+Description=Gitea-to-local-git synchronizer — event-driven two-way sync watcher
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=<user>
+Group=<user>
+EnvironmentFile=/etc/gitea-sync.env
+ExecStart=<install-dir>/scripts/ref-change-watcher
+Restart=always
+RestartSec=5
+# Script errors go to the activity log; keep stdout/stderr out of journald.
+StandardOutput=null
+StandardError=null
+
+[Install]
+WantedBy=multi-user.target
+```
+
+If Gitea runs on this same box under the stock `gitea.service` unit, append `gitea.service` to both `After=` and `Wants=` so the watcher starts after Gitea is up.
+
+If `<user>` is not in a user-private group (i.e. a group with the same name as the user), substitute an appropriate group name for `Group=<user>`.
+
+Load, enable, and start it:
+
+```
+sudo systemctl daemon-reload
+sudo systemctl enable gitea-to-local-git-synchronizer-watcher.service
+sudo systemctl start  gitea-to-local-git-synchronizer-watcher.service
+```
+
+
+## Step 5: Install the cron entry for the pruner (optional)
+
+This runs `orphan-ref-pruner` every 5 minutes as a safety net. `bidirectional-sync` also triggers the pruner immediately whenever anything gets deleted, so this is mostly a background cleanup.
+
+Skip this step if `AUTO_PRUNE=false` is set in `user-settings.conf` — the operator has opted to manage repository garbage collection themselves.
+
+Open `<user>`'s crontab:
+
+```
+crontab -e
+```
+
+Add the line:
+
+```
+*/5 * * * * <install-dir>/scripts/orphan-ref-pruner
+```
+
+
+## Step 6: Verify the installation
+
+Confirm the service is running:
+
+```
+systemctl status gitea-to-local-git-synchronizer-watcher.service
+```
+
+Expect `Active: active (running)`.
+
+Trigger a manual sync to confirm end-to-end plumbing works:
+
+```
+<install-dir>/scripts/bidirectional-sync
+```
+
+Expect exit code 0 and no new `ERROR` lines in the activity log:
+
+```
+tail -20 <install-dir>/activity-log/activity.log
+```
+
+Within `HEARTBEAT_SECONDS` (12 hours by default), a heartbeat line should appear in that log reading `heartbeat: synchronizer is operational, local and Gitea repositories are in sync, orphaned commits have been pruned`.
+
+
+## When something goes wrong
+
+- **Service won't start:** `journalctl -u gitea-to-local-git-synchronizer-watcher.service -n 50`. Likely causes: a bad path in `ExecStart`, a missing or unreadable `/etc/gitea-sync.env`, or an unset required variable (`GITEA_URL`, `GITEA_USER`, `GITEA_TOKEN`, or `SCAN_ROOTS`) — the scripts abort immediately in that case.
+- **Service is running but nothing appears to sync:** run `<install-dir>/scripts/bidirectional-sync` by hand and watch stderr. Also check `<install-dir>/activity-log/activity.log` for `ERROR` lines.
+- **Gitea rejects pushes:** the token lacks `repo` write permission, is wrong, or has expired.
+- **Repos aren't being picked up:** check `SCAN_ROOTS` in `/etc/gitea-sync.env` points at the right folder, that repo paths contain no spaces, and that repo names only contain `A-Z a-z 0-9 . _ -`.
+- **Auto-import into Gitea fails:** Gitea is blocking local-network migrations. Set `[migrations] ALLOW_LOCALNETWORKS = true` in `app.ini` and restart Gitea.
+- **DB reconcile / pull-ref pruning does nothing:** the service user cannot access `GITEA_DB` and `GITEA_REPOS_DIR`. Re-check the group membership and permissions from the "If Gitea runs on the same box" section. If Gitea is on a different host, set both variables to empty strings.
+- **Watcher silently stops picking up changes on a large tree:** `inotify` has hit `fs.inotify.max_user_watches`. Raise it, e.g. `echo 'fs.inotify.max_user_watches=524288' | sudo tee /etc/sysctl.d/40-inotify.conf && sudo sysctl --system`.
+
+
+## Uninstall
+
+```
+sudo systemctl stop    gitea-to-local-git-synchronizer-watcher.service
+sudo systemctl disable gitea-to-local-git-synchronizer-watcher.service
+sudo rm /etc/systemd/system/gitea-to-local-git-synchronizer-watcher.service
+sudo systemctl daemon-reload
+crontab -e    # and remove the orphan-ref-pruner line
+sudo rm /etc/gitea-sync.env
+rm -rf <install-dir>
+```
+
+Gitea's bare repositories and the user's working trees are left untouched.

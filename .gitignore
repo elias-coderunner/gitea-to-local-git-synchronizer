@@ -1,0 +1,12 @@
+# Runtime log (per-install, grows forever, may contain repo names)
+activity-log/*
+!activity-log/.gitkeep
+
+# Watcher heartbeat timestamp (runtime state)
+support-artifacts/.heartbeat
+
+# Editor / OS noise
+.vscode/
+.idea/
+*.swp
+.DS_Store

@@ -1,0 +1,372 @@
+#!/usr/bin/env bash
+# Technical details: script-internals/bidirectional-sync.md
+
+set -uo pipefail
+
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$PROJECT_ROOT/support-artifacts/shared-helpers.sh"
+
+api() {
+    local method=$1 path=$2
+    shift 2
+    curl -sS -X "$method" \
+        -H "Authorization: token $GITEA_TOKEN" \
+        -H "Content-Type: application/json" \
+        "$GITEA_URL$path" "$@"
+}
+
+repo_name_for() { basename "$(dirname "$1")"; }
+
+list_gitea_repos() {
+    # Emit one repo name per line owned by $GITEA_USER on gitea.
+    local page=1
+    while :; do
+        local body
+        body=$(api GET "/api/v1/users/$GITEA_USER/repos?limit=$GITEA_API_PAGE_SIZE&page=$page")
+        local names
+        names=$(echo "$body" | python3 -c 'import sys,json
+try:
+    data = json.loads(sys.stdin.read())
+    if isinstance(data, list):
+        for r in data:
+            print(r.get("name", ""))
+except Exception:
+    pass' 2>/dev/null)
+        [ -z "$names" ] && break
+        echo "$names"
+        # Fewer than a full page → done.
+        local count
+        count=$(echo "$names" | grep -c . )
+        [ "$count" -lt "$GITEA_API_PAGE_SIZE" ] && break
+        page=$((page + 1))
+    done
+}
+
+repo_exists() {
+    # 200 = exists. 307 = exists but user/repo was renamed (gitea redirect).
+    local name=$1 code
+    code=$(curl -sS -o /dev/null -w "%{http_code}" \
+        -H "Authorization: token $GITEA_TOKEN" \
+        "$GITEA_URL/api/v1/repos/$GITEA_USER/$name")
+    [ "$code" = "200" ] || [ "$code" = "307" ]
+}
+
+import_repo() {
+    local gitdir=$1 name=$2 worktree body resp
+    worktree=$(dirname "$gitdir")
+    body=$(printf '{"clone_addr":"%s","repo_name":"%s","repo_owner":"%s","mirror":false,"private":true,"description":"Auto-imported from %s"}' \
+        "$worktree" "$name" "$GITEA_USER" "$worktree")
+    resp=$(api POST /api/v1/repos/migrate --data "$body")
+    if echo "$resp" | grep -q '"full_name"'; then
+        return 0
+    else
+        err_log "import failed for $name: $resp"
+        return 1
+    fi
+}
+
+# See script-internals/bidirectional-sync-1.md
+sync_repo() {
+    local gitdir=$1 name=$2 bare worktree push_url
+    bare="$GITEA_REPOS_DIR/$GITEA_USER/$name.git"
+    if [ ! -d "$bare" ]; then
+        err_log "bare missing for $name — skipping"
+        echo "0 1"
+        return 1
+    fi
+    worktree=$(dirname "$gitdir")
+    push_url="${GITEA_URL%%://*}://${GITEA_USER}:${GITEA_TOKEN}@${GITEA_URL#*://}/${GITEA_USER}/${name}.git"
+
+    local before_count
+    before_count=$(git -C "$worktree" rev-list --all --count 2>/dev/null || echo 0)
+
+    # Fetch gitea's state into a hidden namespace. --prune drops refs gitea
+    # has deleted so our view stays accurate.
+    if ! git -C "$worktree" fetch --quiet --prune "$bare" \
+            "+refs/heads/*:refs/sync/gitea/heads/*" \
+            "+refs/tags/*:refs/sync/gitea/tags/*" 2>/dev/null; then
+        err_log "fetch-from-gitea failed for $name"
+        echo "0 1"
+        return 1
+    fi
+
+    # Load previous-state files (per-repo). Empty on first run.
+    local state_dir="$gitdir/info"
+    mkdir -p "$state_dir" 2>/dev/null
+    local sprev_local="$state_dir/g2l-sync-local-prev.tsv"
+    local sprev_gitea="$state_dir/g2l-sync-gitea-prev.tsv"
+    local -A local_prev=() gitea_prev=()
+    if [ -f "$sprev_local" ]; then
+        while IFS=$'\t' read -r b s; do [ -n "$b" ] && local_prev[$b]=$s; done < "$sprev_local"
+    fi
+    if [ -f "$sprev_gitea" ]; then
+        while IFS=$'\t' read -r b s; do [ -n "$b" ] && gitea_prev[$b]=$s; done < "$sprev_gitea"
+    fi
+
+    # Current branch sets.
+    local -A local_now=() gitea_now=()
+    while IFS=' ' read -r b s; do [ -n "$b" ] && local_now[$b]=$s
+    done < <(git -C "$worktree" for-each-ref --format='%(refname:strip=2) %(objectname)' refs/heads/ 2>/dev/null)
+    while IFS=' ' read -r b s; do [ -n "$b" ] && gitea_now[$b]=$s
+    done < <(git -C "$worktree" for-each-ref --format='%(refname:strip=4) %(objectname)' refs/sync/gitea/heads/ 2>/dev/null)
+
+    # Union of every branch name we need to consider.
+    local -A seen=()
+    for b in "${!local_now[@]}" "${!gitea_now[@]}" "${!local_prev[@]}" "${!gitea_prev[@]}"; do
+        seen[$b]=1
+    done
+
+    local current_branch
+    current_branch=$(git -C "$worktree" symbolic-ref --quiet --short HEAD 2>/dev/null || echo "")
+
+    local conflicts=0 branch local_sha gitea_sha
+    for branch in "${!seen[@]}"; do
+        local_sha=${local_now[$branch]:-}
+        gitea_sha=${gitea_now[$branch]:-}
+
+        if [ -n "$local_sha" ] && [ -n "$gitea_sha" ]; then
+            # Both sides have the branch → commit-level sync.
+            if [ "$local_sha" = "$gitea_sha" ]; then
+                :
+            elif git -C "$worktree" merge-base --is-ancestor "$local_sha" "$gitea_sha" 2>/dev/null; then
+                if [ "$branch" = "$current_branch" ]; then
+                    git -C "$worktree" merge --quiet --ff-only "$gitea_sha" 2>/dev/null \
+                        || { err_log "ff-merge failed on checked-out $name/$branch"; conflicts=$((conflicts+1)); }
+                else
+                    git -C "$worktree" update-ref "refs/heads/$branch" "$gitea_sha" 2>/dev/null \
+                        || { err_log "update-ref failed: $name/$branch"; conflicts=$((conflicts+1)); }
+                fi
+            elif git -C "$worktree" merge-base --is-ancestor "$gitea_sha" "$local_sha" 2>/dev/null; then
+                git -C "$worktree" push --quiet "$push_url" \
+                    "refs/heads/$branch:refs/heads/$branch" 2>/dev/null \
+                    || { err_log "push failed: $name/$branch"; conflicts=$((conflicts+1)); }
+            else
+                err_log "divergence on $name/$branch — resolve manually"
+                conflicts=$((conflicts+1))
+            fi
+
+        elif [ -n "$local_sha" ] && [ -z "$gitea_sha" ]; then
+            # Local has it; gitea doesn't. Either the user deleted on gitea,
+            # or this is a brand-new local branch.
+            if [ -n "${gitea_prev[$branch]:-}" ]; then
+                # Branch WAS known on gitea → user deleted it on gitea → propagate.
+                if [ "$branch" = "$current_branch" ]; then
+                    err_log "cannot delete currently-checked-out branch $name/$branch locally; check out another branch first"
+                    conflicts=$((conflicts+1))
+                else
+                    if git -C "$worktree" branch -D "$branch" 2>/dev/null; then
+                        touch "${deletion_sentinel:-/tmp/.g2l-deletions-sentinel}"
+                    else
+                        err_log "local delete failed: $name/$branch"; conflicts=$((conflicts+1))
+                    fi
+                fi
+            else
+                # New local branch → push up.
+                git -C "$worktree" push --quiet "$push_url" \
+                    "refs/heads/$branch:refs/heads/$branch" 2>/dev/null \
+                    || { err_log "push failed: $name/$branch"; conflicts=$((conflicts+1)); }
+            fi
+
+        elif [ -z "$local_sha" ] && [ -n "$gitea_sha" ]; then
+            # Gitea has it; local doesn't. Either the user deleted locally,
+            # or this is a brand-new gitea branch.
+            if [ -n "${local_prev[$branch]:-}" ]; then
+                # Branch WAS known locally → user deleted it locally → delete on gitea.
+                if git -C "$worktree" push --quiet "$push_url" --delete "$branch" 2>/dev/null; then
+                    touch "${deletion_sentinel:-/tmp/.g2l-deletions-sentinel}"
+                else
+                    err_log "gitea delete failed: $name/$branch"; conflicts=$((conflicts+1))
+                fi
+            else
+                # New gitea branch → create locally at gitea's tip.
+                git -C "$worktree" branch "$branch" "$gitea_sha" 2>/dev/null \
+                    || { err_log "local branch create failed: $name/$branch"; conflicts=$((conflicts+1)); }
+            fi
+        fi
+        # Both empty: branch existed only in prev state and is gone from both.
+        # Nothing to do; state file will omit it next run.
+    done
+
+    # Tag sync (same create/delete logic as branches).
+    local sprev_local_tags="$state_dir/g2l-sync-local-tags-prev.tsv"
+    local sprev_gitea_tags="$state_dir/g2l-sync-gitea-tags-prev.tsv"
+    local -A ltag_prev=() gtag_prev=() ltag_now=() gtag_now=()
+    [ -f "$sprev_local_tags" ] && while IFS=$'\t' read -r t s; do [ -n "$t" ] && ltag_prev[$t]=$s; done < "$sprev_local_tags"
+    [ -f "$sprev_gitea_tags" ] && while IFS=$'\t' read -r t s; do [ -n "$t" ] && gtag_prev[$t]=$s; done < "$sprev_gitea_tags"
+    while IFS=' ' read -r t s; do [ -n "$t" ] && ltag_now[$t]=$s
+    done < <(git -C "$worktree" for-each-ref --format='%(refname:strip=2) %(objectname)' refs/tags/ 2>/dev/null)
+    while IFS=' ' read -r t s; do [ -n "$t" ] && gtag_now[$t]=$s
+    done < <(git -C "$worktree" for-each-ref --format='%(refname:strip=4) %(objectname)' refs/sync/gitea/tags/ 2>/dev/null)
+    local -A seen_tags=()
+    for t in "${!ltag_now[@]}" "${!gtag_now[@]}" "${!ltag_prev[@]}" "${!gtag_prev[@]}"; do seen_tags[$t]=1; done
+    for t in "${!seen_tags[@]}"; do
+        local ls=${ltag_now[$t]:-} gs=${gtag_now[$t]:-}
+        if [ -n "$ls" ] && [ -z "$gs" ]; then
+            if [ -n "${gtag_prev[$t]:-}" ]; then
+                if git -C "$worktree" tag -d "$t" 2>/dev/null; then
+                    touch "${deletion_sentinel:-/tmp/.g2l-deletions-sentinel}"
+                else
+                    err_log "local tag delete failed: $name/$t"; conflicts=$((conflicts+1))
+                fi
+            else
+                git -C "$worktree" push --quiet "$push_url" "refs/tags/$t:refs/tags/$t" 2>/dev/null \
+                    || { err_log "tag push failed: $name/$t"; conflicts=$((conflicts+1)); }
+            fi
+        elif [ -z "$ls" ] && [ -n "$gs" ]; then
+            if [ -n "${ltag_prev[$t]:-}" ]; then
+                if git -C "$worktree" push --quiet "$push_url" --delete "refs/tags/$t" 2>/dev/null; then
+                    touch "${deletion_sentinel:-/tmp/.g2l-deletions-sentinel}"
+                else
+                    err_log "gitea tag delete failed: $name/$t"; conflicts=$((conflicts+1))
+                fi
+            else
+                git -C "$worktree" update-ref "refs/tags/$t" "$gs" 2>/dev/null \
+                    || { err_log "local tag create failed: $name/$t"; conflicts=$((conflicts+1)); }
+            fi
+        fi
+    done
+
+    # Persist post-sync state. The state files below reflect ACTUAL current
+    # refs on both sides after this run's deletes/creates/updates.
+    {
+        git -C "$worktree" for-each-ref --format='%(refname:strip=2)	%(objectname)' refs/heads/ 2>/dev/null
+    } > "$sprev_local"
+    {
+        git -C "$bare" for-each-ref --format='%(refname:strip=2)	%(objectname)' refs/heads/ 2>/dev/null
+    } > "$sprev_gitea"
+    {
+        git -C "$worktree" for-each-ref --format='%(refname:strip=2)	%(objectname)' refs/tags/ 2>/dev/null
+    } > "$sprev_local_tags"
+    {
+        git -C "$bare" for-each-ref --format='%(refname:strip=2)	%(objectname)' refs/tags/ 2>/dev/null
+    } > "$sprev_gitea_tags"
+
+    local after_count delta
+    after_count=$(git -C "$worktree" rev-list --all --count 2>/dev/null || echo 0)
+    delta=$((after_count - before_count))
+    [ "$delta" -lt 0 ] && delta=0
+    echo "$delta $conflicts"
+}
+
+# See script-internals/bidirectional-sync-2.md
+reconcile_gitea_db() {
+    local db=${GITEA_DB:-/var/lib/gitea/data/gitea.db}
+    [ -f "$db" ] || return 0
+    [ -x "$(command -v sqlite3)" ] || return 0
+    # For every non-deleted branch in the DB, check the matching ref in the
+    # bare. If missing, mark deleted.
+    while IFS='|' read -r branch_id branch_name repo_name; do
+        [ -z "$branch_id" ] && continue
+        local bare="$GITEA_REPOS_DIR/$GITEA_USER/$repo_name.git"
+        if [ ! -d "$bare" ]; then
+            # Repo itself is gone; sweep this row too.
+            sqlite3 "$db" "UPDATE branch SET is_deleted=1 WHERE id=$branch_id;" 2>/dev/null
+            continue
+        fi
+        if ! git -C "$bare" rev-parse --quiet --verify "refs/heads/$branch_name" >/dev/null 2>&1; then
+            sqlite3 "$db" "UPDATE branch SET is_deleted=1 WHERE id=$branch_id;" 2>/dev/null
+            err_log "reconciled phantom branch in gitea DB: $repo_name/$branch_name"
+        fi
+    done < <(sqlite3 "$db" "SELECT b.id, b.name, r.name FROM branch b JOIN repository r ON b.repo_id = r.id WHERE b.is_deleted = 0 AND r.owner_name = '$GITEA_USER';" 2>/dev/null)
+}
+
+main() {
+    local gitdir name imported=0 commits=0 conflicts=0 delta cdelta
+    # See script-internals/bidirectional-sync-3.md
+    local deletion_sentinel="/tmp/.g2l-deletions-sentinel"
+    rm -f "$deletion_sentinel"
+    # Collect repos we scanned so we can verify sync status afterwards
+    # without walking the filesystem twice.
+    local -a scanned_pairs=()      # "<name>|<worktree>"
+    local -A known_local_names=()  # repo names currently on disk
+    while IFS= read -r gitdir; do
+        [ -z "$gitdir" ] && continue
+        name=$(repo_name_for "$gitdir")
+        if ! [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            err_log "skip (bad repo name): $gitdir -> '$name'"
+            continue
+        fi
+        known_local_names[$name]=1
+        if repo_exists "$name"; then
+            read -r delta cdelta < <(sync_repo "$gitdir" "$name")
+            commits=$((commits + delta))
+            conflicts=$((conflicts + cdelta))
+        else
+            # See script-internals/bidirectional-sync-4.md
+            if [ -f "$gitdir/info/g2l-sync-gitea-prev.tsv" ]; then
+                err_log "repo $name was deleted in gitea; leaving local copy untouched (rm or re-import manually)"
+                conflicts=$((conflicts + 1))
+            else
+                if import_repo "$gitdir" "$name"; then
+                    imported=$((imported + 1))
+                fi
+            fi
+        fi
+        scanned_pairs+=("$name|$(dirname "$gitdir")")
+    done < <(find_repos)
+
+    # Pick up repos that exist in gitea but not on disk (created in the UI).
+    # Clone them into the first path in SCAN_ROOTS.
+    local primary_root=${SCAN_ROOTS%% *}
+    if [ -d "$primary_root" ]; then
+        while IFS= read -r remote_name; do
+            [ -z "$remote_name" ] && continue
+            [ -n "${known_local_names[$remote_name]:-}" ] && continue
+            local target="$primary_root/$remote_name"
+            [ -e "$target" ] && continue  # name clash on disk; skip quietly
+            local clone_url="${GITEA_URL%%://*}://${GITEA_USER}:${GITEA_TOKEN}@${GITEA_URL#*://}/${GITEA_USER}/${remote_name}.git"
+            if git clone --quiet "$clone_url" "$target" 2>/dev/null; then
+                known_local_names[$remote_name]=1
+                scanned_pairs+=("$remote_name|$target")
+                imported=$((imported + 1))
+            else
+                err_log "auto-clone from gitea failed for $remote_name"
+                conflicts=$((conflicts + 1))
+            fi
+        done < <(list_gitea_repos)
+    fi
+
+    # See script-internals/bidirectional-sync-5.md
+    local out_of_sync=0 pair n wt bare src_refs dst_refs
+    for pair in "${scanned_pairs[@]}"; do
+        n=${pair%%|*}
+        wt=${pair#*|}
+        bare="$GITEA_REPOS_DIR/$GITEA_USER/$n.git"
+        if [ ! -d "$bare" ]; then
+            out_of_sync=$((out_of_sync + 1))
+            continue
+        fi
+        src_refs=$(git -C "$wt" for-each-ref --format='%(refname) %(objectname)' refs/heads refs/tags 2>/dev/null | sort)
+        dst_refs=$(git -C "$bare" for-each-ref --format='%(refname) %(objectname)' refs/heads refs/tags 2>/dev/null | sort)
+        if [ "$src_refs" != "$dst_refs" ]; then
+            out_of_sync=$((out_of_sync + 1))
+        fi
+    done
+
+    # Reconcile gitea's DB with the actual bare-repo refs. Catches any
+    # drift from bypasses of gitea's hooks.
+    reconcile_gitea_db
+
+    # See script-internals/bidirectional-sync-6.md
+    if [ -f "$deletion_sentinel" ]; then
+        rm -f "$deletion_sentinel"
+        if [ "$AUTO_PRUNE" = "true" ]; then
+            "$PROJECT_ROOT/scripts/orphan-ref-pruner" >/dev/null 2>&1 &
+        fi
+    fi
+
+    # Loud failures only: diverged branches, out-of-sync verification. The
+    # watcher daemon handles the periodic heartbeat; successful runs are silent.
+    if [ "$conflicts" -gt 0 ]; then
+        err_log "sync finished with $conflicts branch(es) needing manual resolution"
+    elif [ "$out_of_sync" -gt 0 ]; then
+        err_log "sync finished with $out_of_sync repo(s) still out of sync"
+    fi
+
+    # Trim log periodically to keep growth bounded.
+    if [ -f "$LOG" ] && [ "$(wc -l < "$LOG")" -gt "$LOG_MAX_LINES" ]; then
+        tail -n "$LOG_MAX_LINES" "$LOG" > "$LOG.tmp" && mv "$LOG.tmp" "$LOG"
+    fi
+}
+
+main "$@"
