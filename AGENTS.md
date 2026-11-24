@@ -26,12 +26,12 @@ A systemd + cron synchronizer that keeps a Gitea instance and a set of local Git
 
 Non-obvious invariants that are easy to break. Check these before editing anything.
 
-- **Required env vars** in `/etc/gitea-sync.env` are `GITEA_URL`, `GITEA_USER`, `GITEA_TOKEN`, `SCAN_ROOTS`. The scripts abort at startup if any is unset. Keep it that way. Do not add fallback defaults for these variables in `shared-helpers.sh` or anywhere else. If a default sneaks back in, a fresh install missing that variable will not fail — it will silently run against whatever value happens to be in the default, which means: syncing to the wrong Gitea server, syncing as the wrong Gitea user, scanning the wrong directories, or writing logs to a path that does not exist on the new machine. The operator sees no error and assumes it works. Fail loud at startup instead.
-- **State-file prefix is `g2l-`** (as in `g2l-sync-local-prev.tsv`, `/tmp/.g2l-deletions-sentinel`). Read and write sites must match. If you rename the prefix, rename every matching read site and migrate existing state files on disk, or the next sync will treat every repo as brand-new.
-- **Systemd unit name is `gitea-to-local-git-synchronizer-watcher.service`.** Canonical source: `installation-instructions` Step 4. Do not rename it in documentation without renaming the unit file itself and every reference.
-- **`activity-log/activity.log` is runtime state**, gitignored. Do not commit log content, and do not write new log lines from documentation examples.
-- **Scheme-preserving URLs.** The push and clone URLs in `bidirectional-sync` derive their scheme from `GITEA_URL`. Do not hardcode `http://` or `https://`.
-- **Filesystem access to Gitea is a hard requirement** (not optional). `sync_repo` fetches from `$GITEA_REPOS_DIR/<user>/<repo>.git` on disk. The synchronizer only works same-box with Gitea or with Gitea's data directory mounted on the sync host.
+- Required env vars in `/etc/gitea-sync.env` are `GITEA_URL`, `GITEA_USER`, `GITEA_TOKEN`, `SCAN_ROOTS`. The scripts abort at startup if any is unset. Keep it that way. Do not add fallback defaults for these variables in `shared-helpers.sh` or anywhere else. If a default sneaks back in, a fresh install missing that variable will not fail — it will silently run against whatever value happens to be in the default, which means: syncing to the wrong Gitea server, syncing as the wrong Gitea user, scanning the wrong directories, or writing logs to a path that does not exist on the new machine. The operator sees no error and assumes it works. Fail loud at startup instead.
+- State-file prefix is `g2l-` (as in `g2l-sync-local-prev.tsv`, `/tmp/.g2l-deletions-sentinel`). Read and write sites must match. If you rename the prefix, rename every matching read site and migrate existing state files on disk, or the next sync will treat every repo as brand-new.
+- Systemd unit name is `gitea-to-local-git-synchronizer-watcher.service`. Canonical source: `installation-instructions` Step 4. Do not rename it in documentation without renaming the unit file itself and every reference.
+- `activity-log/activity.log` is runtime state, gitignored. Do not commit log content, and do not write new log lines from documentation examples.
+- Scheme-preserving URLs. The push and clone URLs in `bidirectional-sync` derive their scheme from `GITEA_URL`. Do not hardcode `http://` or `https://`.
+- Filesystem access to Gitea is a hard requirement (not optional). `sync_repo` fetches from `$GITEA_REPOS_DIR/<user>/<repo>.git` on disk. The synchronizer only works same-box with Gitea or with Gitea's data directory mounted on the sync host.
 
 ## Verifying a change works
 

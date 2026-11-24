@@ -28,7 +28,7 @@ The commands below use placeholder values. Substitute the real ones for the targ
 ### On the Gitea side
 
 1. A running Gitea instance reachable from the sync machine over HTTP or HTTPS.
-2. An account with an API token that has `repo` write permission. Generate the token in Gitea's web UI: Settings → Applications → Generate New Token. **Record the token immediately — it is shown only once.**
+2. An account with an API token that has `repo` write permission. Generate the token in Gitea's web UI: Settings → Applications → Generate New Token. Record the token immediately — it is shown only once.
 3. If the sync machine will auto-import local repositories into Gitea (i.e. repositories that exist locally but not yet on Gitea), Gitea must allow migrations from local/private addresses. In Gitea's `app.ini`:
    ```
    [migrations]
@@ -53,7 +53,7 @@ Log out and back in (or restart the service after Step 4) so the new group takes
 
 ### If Gitea runs on a different host
 
-This synchronizer **requires filesystem access** to Gitea's bare repositories and SQLite database. The core sync fetches from `GITEA_REPOS_DIR/<user>/<repo>.git` directly on disk, not over the Gitea HTTP API, and the auxiliary features (DB reconcile, pull-request pruning) also read and write the Gitea data directory.
+This synchronizer requires filesystem access to Gitea's bare repositories and SQLite database. The core sync fetches from `GITEA_REPOS_DIR/<user>/<repo>.git` directly on disk, not over the Gitea HTTP API, and the auxiliary features (DB reconcile, pull-request pruning) also read and write the Gitea data directory.
 
 Options when Gitea runs on a different host:
 
@@ -199,13 +199,13 @@ Within `HEARTBEAT_SECONDS` (12 hours by default), a heartbeat line should appear
 
 ## When something goes wrong
 
-- **Service won't start:** `journalctl -u gitea-to-local-git-synchronizer-watcher.service -n 50`. Likely causes: a bad path in `ExecStart`, a missing or unreadable `/etc/gitea-sync.env`, or an unset required variable (`GITEA_URL`, `GITEA_USER`, `GITEA_TOKEN`, or `SCAN_ROOTS`) — the scripts abort immediately in that case.
-- **Service is running but nothing appears to sync:** run `<install-dir>/scripts/bidirectional-sync` by hand and watch stderr. Also check `<install-dir>/activity-log/activity.log` for `ERROR` lines.
-- **Gitea rejects pushes:** the token lacks `repo` write permission, is wrong, or has expired.
-- **Repos aren't being picked up:** check `SCAN_ROOTS` in `/etc/gitea-sync.env` points at the right folder, that repo paths contain no spaces, and that repo names only contain `A-Z a-z 0-9 . _ -`.
-- **Auto-import into Gitea fails:** Gitea is blocking local-network migrations. Set `[migrations] ALLOW_LOCALNETWORKS = true` in `app.ini` and restart Gitea.
-- **DB reconcile / pull-ref pruning does nothing:** the service user cannot access `GITEA_DB` and `GITEA_REPOS_DIR`. Re-check the group membership and permissions from the "If Gitea runs on the same box" section. If Gitea is on a different host, set both variables to empty strings.
-- **Watcher silently stops picking up changes on a large tree:** `inotify` has hit `fs.inotify.max_user_watches`. Raise it, e.g. `echo 'fs.inotify.max_user_watches=524288' | sudo tee /etc/sysctl.d/40-inotify.conf && sudo sysctl --system`.
+- Service won't start: `journalctl -u gitea-to-local-git-synchronizer-watcher.service -n 50`. Likely causes: a bad path in `ExecStart`, a missing or unreadable `/etc/gitea-sync.env`, or an unset required variable (`GITEA_URL`, `GITEA_USER`, `GITEA_TOKEN`, or `SCAN_ROOTS`) — the scripts abort immediately in that case.
+- Service is running but nothing appears to sync: run `<install-dir>/scripts/bidirectional-sync` by hand and watch stderr. Also check `<install-dir>/activity-log/activity.log` for `ERROR` lines.
+- Gitea rejects pushes: the token lacks `repo` write permission, is wrong, or has expired.
+- Repos aren't being picked up: check `SCAN_ROOTS` in `/etc/gitea-sync.env` points at the right folder, that repo paths contain no spaces, and that repo names only contain `A-Z a-z 0-9 . _ -`.
+- Auto-import into Gitea fails: Gitea is blocking local-network migrations. Set `[migrations] ALLOW_LOCALNETWORKS = true` in `app.ini` and restart Gitea.
+- DB reconcile / pull-ref pruning does nothing: the service user cannot access `GITEA_DB` and `GITEA_REPOS_DIR`. Re-check the group membership and permissions from the "If Gitea runs on the same box" section. If Gitea is on a different host, set both variables to empty strings.
+- Watcher silently stops picking up changes on a large tree: `inotify` has hit `fs.inotify.max_user_watches`. Raise it, e.g. `echo 'fs.inotify.max_user_watches=524288' | sudo tee /etc/sysctl.d/40-inotify.conf && sudo sysctl --system`.
 
 
 ## Uninstall

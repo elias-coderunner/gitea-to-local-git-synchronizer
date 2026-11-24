@@ -1,6 +1,6 @@
 # README - Syncing Gitea and machine-native Git
 
-*Continuous bidirectional sync between every machine-native Git repository and its Gitea copy.*
+Continuous bidirectional sync between every machine-native Git repository and its Gitea copy.
 
 
 
