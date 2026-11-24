@@ -55,7 +55,7 @@ Auto-pruning is on by default. The user can disable it by setting `AUTO_PRUNE=fa
 
 # Solution
 
-To solve this problem, a set of synchronization scripts was developed. It keeps the machine's native repositories and Gitea's bare repositories in continuous bidirectional sync. The user can make edits from the terminal, from an agent, or from Gitea's dashboard, and all three paths converge on the same source of truth.
+This set of synchronization scripts keeps the machine's native repositories and Gitea's bare repositories in continuous bidirectional sync. The user can make edits from the terminal, from an agent, or from Gitea's dashboard, and all three paths converge on the same source of truth.
 
 
 ## bidirectional-sync — keeps every local git repo and its Gitea copy identical

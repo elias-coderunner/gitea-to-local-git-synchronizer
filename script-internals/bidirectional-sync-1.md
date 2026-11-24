@@ -2,7 +2,7 @@
 
 Two-way sync for one repo, including branch creations AND deletions.
 
-Uses a tiny state file inside `.git/info/` to remember the last-known branch set on each side. This lets us tell "branch missing because the other side deleted it" apart from "branch missing because this side just created it."
+Uses a tiny state file inside `.git/info/` to remember the last-known branch set on each side. This lets the script tell "branch missing because the other side deleted it" apart from "branch missing because this side just created it."
 
 ## Per-branch decision matrix
 

@@ -25,7 +25,7 @@ heartbeat_if_due() {
     fi
 }
 
-# Enumerate all directories that hold refs we care about: every local .git/refs
+# Enumerate all directories that hold relevant refs: every local .git/refs
 # under SCAN_ROOTS plus every Gitea bare repo's refs.
 watch_paths() {
     # Local repos: watch each .git directory. refs/ and HEAD cover all branch moves.
@@ -57,7 +57,7 @@ debounced_sync() {
 }
 
 main() {
-    # One sync on startup so we begin in a consistent state.
+    # One sync on startup so the watcher begins in a consistent state.
     "$SYNC"
     heartbeat_if_due
 
@@ -73,7 +73,7 @@ main() {
         fi
 
         # Wait for ANY event on any watched path, or RESCAN_SECONDS timeout.
-        # -q quiet, -r recursive, -e the events we care about.
+        # -q quiet, -r recursive, -e the relevant events.
         if inotifywait -q -r -t "$RESCAN_SECONDS" \
                 -e modify,create,delete,move,close_write \
                 "${PATHS[@]}" >/dev/null 2>&1; then

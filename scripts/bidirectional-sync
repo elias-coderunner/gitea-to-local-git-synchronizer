@@ -81,7 +81,7 @@ sync_repo() {
     before_count=$(git -C "$worktree" rev-list --all --count 2>/dev/null || echo 0)
 
     # Fetch gitea's state into a hidden namespace. --prune drops refs gitea
-    # has deleted so our view stays accurate.
+    # has deleted so the synchronizer's view stays accurate.
     if ! git -C "$worktree" fetch --quiet --prune "$bare" \
             "+refs/heads/*:refs/sync/gitea/heads/*" \
             "+refs/tags/*:refs/sync/gitea/tags/*" 2>/dev/null; then
@@ -110,7 +110,7 @@ sync_repo() {
     while IFS=' ' read -r b s; do [ -n "$b" ] && gitea_now[$b]=$s
     done < <(git -C "$worktree" for-each-ref --format='%(refname:strip=4) %(objectname)' refs/sync/gitea/heads/ 2>/dev/null)
 
-    # Union of every branch name we need to consider.
+    # Union of every branch name to consider.
     local -A seen=()
     for b in "${!local_now[@]}" "${!gitea_now[@]}" "${!local_prev[@]}" "${!gitea_prev[@]}"; do
         seen[$b]=1
@@ -275,7 +275,7 @@ main() {
     # See script-internals/bidirectional-sync-3.md
     local deletion_sentinel="/tmp/.g2l-deletions-sentinel"
     rm -f "$deletion_sentinel"
-    # Collect repos we scanned so we can verify sync status afterwards
+    # Collect scanned repos so the verification pass below can run
     # without walking the filesystem twice.
     local -a scanned_pairs=()      # "<name>|<worktree>"
     local -A known_local_names=()  # repo names currently on disk
