@@ -21,8 +21,8 @@ Per branch:
 
 |                             | gitea has it: yes          | gitea has it: no                                                |
 |-----------------------------|----------------------------|-----------------------------------------------------------------|
-| **local has it: yes**       | commit sync                | was-in-gitea-prev? → delete local; else → push to gitea         |
-| **local has it: no**        | was-in-local-prev? → delete on gitea; else → create local branch | —                                                               |
+| local has it: yes       | commit sync                | was-in-gitea-prev? → delete local; else → push to gitea         |
+| local has it: no        | was-in-local-prev? → delete on gitea; else → create local branch | —                                                               |
 
 Reads from Gitea via the bare repository path on disk (fast, local filesystem). Writes to Gitea via HTTP so that Gitea's receive hooks fire and its DB counters stay correct.
 

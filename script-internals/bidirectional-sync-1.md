@@ -8,8 +8,8 @@ Uses a tiny state file inside `.git/info/` to remember the last-known branch set
 
 |                      | gitea has it: yes          | gitea has it: no                                      |
 |----------------------|----------------------------|-------------------------------------------------------|
-| **local has it: yes** | commit sync               | was-in-gitea-prev? → delete local; else → push to gitea |
-| **local has it: no**  | was-in-local-prev? → delete on gitea; else → create local branch | — |
+| local has it: yes | commit sync               | was-in-gitea-prev? → delete local; else → push to gitea |
+| local has it: no  | was-in-local-prev? → delete on gitea; else → create local branch | — |
 
 ## Read/write paths
 
